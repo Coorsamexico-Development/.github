@@ -1,0 +1,185 @@
+name: Android Play release
+
+# Workflow reutilizable de la organización.
+# Cada app llama desde su repo con `uses:` y sus propios inputs.
+# Los secrets de Android son por app; el service account de Play puede ser
+# un secret de organización compartido.
+
+on:
+  workflow_call:
+    inputs:
+      package-name:
+        description: 'applicationId de la app'
+        required: true
+        type: string
+      working-directory:
+        description: 'Directorio de la app Flutter dentro del repo'
+        required: false
+        default: '.'
+        type: string
+      build-args:
+        description: 'Argumentos para flutter build appbundle (incluye --release)'
+        required: false
+        default: '--release'
+        type: string
+      tag-prefix:
+        description: 'Prefijo de los tags de release (app-v*, app-interna-v*)'
+        required: false
+        default: 'app'
+        type: string
+      keystore-path:
+        description: 'Ruta del keystore relativa a la raíz del repo'
+        required: false
+        default: 'android/upload-keystore.jks'
+        type: string
+      key-properties-path:
+        description: 'Ruta de key.properties relativa a la raíz del repo'
+        required: false
+        default: 'android/key.properties'
+        type: string
+      store-file-name:
+        description: 'Valor de storeFile en key.properties'
+        required: false
+        default: 'upload-keystore.jks'
+        type: string
+      whatsnew-directory:
+        description: 'Directorio de notas de release relativo a la app'
+        required: false
+        default: 'store/whatsnew'
+        type: string
+      symbols-path:
+        description: 'Directorio de símbolos de ofuscación relativo a la app'
+        required: false
+        default: 'build/symbols'
+        type: string
+      artifact-name:
+        description: 'Nombre del artifact con AAB y símbolos'
+        required: false
+        default: 'android-aab'
+        type: string
+      java-version:
+        description: 'Versión de Java'
+        required: false
+        default: '17'
+        type: string
+      flutter-channel:
+        description: 'Canal de Flutter'
+        required: false
+        default: 'stable'
+        type: string
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: true
+      ANDROID_STORE_PASSWORD:
+        required: true
+      ANDROID_KEY_PASSWORD:
+        required: true
+      ANDROID_KEY_ALIAS:
+        required: true
+      PLAY_SERVICE_ACCOUNT_JSON:
+        required: true
+      GOOGLE_SERVICES_JSON_BASE64:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    concurrency:
+      group: play-${{ inputs.package-name }}-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verificar tag contra pubspec.yaml
+        env:
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          APP_DIR: ${{ inputs.working-directory }}
+        run: |
+          version=$(grep -E '^version:' "${APP_DIR}/pubspec.yaml" | awk '{print $2}')
+          case "${GITHUB_REF_NAME}" in
+            "${TAG_PREFIX}-interna-v"*) track=internal; esperado="${TAG_PREFIX}-interna-v${version}" ;;
+            "${TAG_PREFIX}-v"*)         track=production; esperado="${TAG_PREFIX}-v${version}" ;;
+            *) echo "Tag ${GITHUB_REF_NAME} no reconocido para el prefijo ${TAG_PREFIX}"; exit 1 ;;
+          esac
+          if [ "${GITHUB_REF_NAME}" != "${esperado}" ]; then
+            echo "El tag ${GITHUB_REF_NAME} no coincide con la versión ${version} de ${APP_DIR}/pubspec.yaml"
+            exit 1
+          fi
+          echo "PLAY_TRACK=${track}" >> "$GITHUB_ENV"
+          echo "Track: ${track}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ inputs.flutter-channel }}
+          cache: true
+
+      - name: Restaurar firma
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          GOOGLE_SERVICES_B64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          APP_DIR: ${{ inputs.working-directory }}
+          KEYSTORE_PATH: ${{ inputs.keystore-path }}
+          KEY_PROPERTIES_PATH: ${{ inputs.key-properties-path }}
+          STORE_FILE_NAME: ${{ inputs.store-file-name }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "Falta el secret ANDROID_KEYSTORE_BASE64"
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$KEYSTORE_PATH"
+          if [ -n "$GOOGLE_SERVICES_B64" ]; then
+            echo "$GOOGLE_SERVICES_B64" | base64 -d > "$APP_DIR/android/app/google-services.json"
+          fi
+          cat > "$KEY_PROPERTIES_PATH" <<PROPS
+          storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          storeFile=${STORE_FILE_NAME}
+          PROPS
+
+      - name: Acotar la memoria de Gradle
+        run: |
+          mkdir -p ~/.gradle
+          printf '%s\n' 'org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError' 'kotlin.daemon.jvmargs=-Xmx1g' 'org.gradle.workers.max=2' >> ~/.gradle/gradle.properties
+
+      - name: Dependencias, análisis y pruebas
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TZ: America/Mexico_City
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Construir AAB
+        working-directory: ${{ inputs.working-directory }}
+        run: flutter build appbundle ${{ inputs.build-args }}
+
+      - name: Guardar AAB y símbolos
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            ${{ inputs.working-directory }}/build/app/outputs/bundle/release/app-release.aab
+            ${{ inputs.working-directory }}/${{ inputs.symbols-path }}
+
+      - name: Subir a Play Console
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.package-name }}
+          releaseFiles: ${{ inputs.working-directory }}/build/app/outputs/bundle/release/app-release.aab
+          track: ${{ env.PLAY_TRACK }}
+          status: completed
+          whatsNewDirectory: ${{ inputs.working-directory }}/${{ inputs.whatsnew-directory }}
